@@ -5,7 +5,11 @@ Runs baseline vs full server.chat at multiple generation lengths,
 printing results immediately after each length completes.
 
 Enables VERILM_COMMIT_TIMERS to get per-phase breakdown:
-  generate → sync → drain → commit (pack_a + pack_fr + rust)
+  server.py:   generate → sync → drains → prep → manifest →
+               commit (numpy / scales / concat / pack_fr / assemble / rs_total) →
+               store / json / response
+  verilm-py:   commit_minimal_packed (extract / rust_inner)
+  prover:      commit_minimal_packed (leaf_hash / io_chain / trees / assemble)
 
 Usage:
     # Via RunPod:
@@ -104,7 +108,7 @@ def _run_bench():
 
     results = {}
 
-    for max_tokens in [16, 64, 128, 256, 1024]:
+    for max_tokens in [32, 128, 512]:
         n_iters = N_ITERS if max_tokens <= 128 else max(3, N_ITERS // 2)
         params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
         print(f"\n{'='*70}")

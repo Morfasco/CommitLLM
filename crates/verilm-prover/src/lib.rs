@@ -206,23 +206,44 @@ pub fn build_retained_from_captures(
 /// Returns `[n_layers][n_tokens]` — one `KvEntry` per (layer, position).
 pub fn compute_kv_transcript(
     captured_x_attn: &[Vec<Vec<i8>>],
-    weights: &dyn ShellWeights,
+    weights: &(dyn ShellWeights + Sync),
     cfg: &verilm_core::constants::ModelConfig,
     captured_scales: &[Vec<CapturedLayerScales>],
     per_tensor_scales: &[Vec<f32>],
     per_channel_scales: &[Vec<Vec<f32>>],
     qkv_biases: &[[Vec<f32>; 3]],
 ) -> Vec<Vec<KvEntry>> {
+    use rayon::prelude::*;
+
     let n_layers = cfg.n_layers;
     let n_tokens = captured_x_attn.len();
     let use_rope = !per_tensor_scales.is_empty() || !per_channel_scales.is_empty();
 
-    let mut result: Vec<Vec<KvEntry>> = (0..n_layers)
-        .map(|_| Vec::with_capacity(n_tokens))
+    let k_mt_idx = MatrixType::PER_LAYER
+        .iter()
+        .position(|&m| m == MatrixType::Wk)
+        .unwrap();
+    let v_mt_idx = MatrixType::PER_LAYER
+        .iter()
+        .position(|&m| m == MatrixType::Wv)
+        .unwrap();
+
+    // Flat (token_pos, layer_idx) work list — preserves the original token-major
+    // iteration order, including the `n_layers.min(token_x_attn.len())` guard.
+    let work: Vec<(usize, usize)> = (0..n_tokens)
+        .flat_map(|t| {
+            let layer_count = n_layers.min(captured_x_attn[t].len());
+            (0..layer_count).map(move |l| (t, l))
+        })
         .collect();
 
-    for (token_pos, token_x_attn) in captured_x_attn.iter().enumerate() {
-        for layer_idx in 0..n_layers.min(token_x_attn.len()) {
+    // Parallel compute. IndexedParallelIterator preserves order on collect,
+    // so the rebucket loop below produces byte-identical [n_layers][n_tokens]
+    // output to the serial implementation.
+    let entries: Vec<(usize, usize, KvEntry)> = work
+        .into_par_iter()
+        .map(|(token_pos, layer_idx)| {
+            let token_x_attn = &captured_x_attn[token_pos];
             let x_attn = &token_x_attn[layer_idx];
             let scale_x = captured_scales[token_pos][layer_idx].scale_x_attn;
 
@@ -241,16 +262,6 @@ pub fn compute_kv_transcript(
             );
 
             let (k_roped, v_deq) = if use_rope {
-                // Production: dequantize with per-channel or per-tensor scales, then RoPE for K
-                let k_mt_idx = MatrixType::PER_LAYER
-                    .iter()
-                    .position(|&m| m == MatrixType::Wk)
-                    .unwrap();
-                let v_mt_idx = MatrixType::PER_LAYER
-                    .iter()
-                    .position(|&m| m == MatrixType::Wv)
-                    .unwrap();
-
                 let k_f64 = if !per_channel_scales.is_empty()
                     && layer_idx < per_channel_scales.len()
                     && !per_channel_scales[layer_idx][k_mt_idx].is_empty()
@@ -287,7 +298,6 @@ pub fn compute_kv_transcript(
                     verilm_core::rope::dequantize_acc(&v_acc, Some(sw), Some(scale_x))
                 };
 
-                // Add projection biases (model-dependent, e.g. Qwen2)
                 let k_f64 = if layer_idx < qkv_biases.len() && !qkv_biases[layer_idx][1].is_empty()
                 {
                     k_f64
@@ -312,7 +322,6 @@ pub fn compute_kv_transcript(
                 let k_roped = verilm_core::rope::apply_rope_k(&k_f64, token_pos, cfg);
                 (k_roped, v_f64)
             } else {
-                // Toy: requantize i32→i8, store as f64 (matches kv_entries_from_traces)
                 let k_i8 = verilm_core::requantize(&k_acc);
                 let v_i8 = verilm_core::requantize(&v_acc);
                 (
@@ -321,8 +330,15 @@ pub fn compute_kv_transcript(
                 )
             };
 
-            result[layer_idx].push(KvEntry { k_roped, v_deq });
-        }
+            (token_pos, layer_idx, KvEntry { k_roped, v_deq })
+        })
+        .collect();
+
+    let mut result: Vec<Vec<KvEntry>> = (0..n_layers)
+        .map(|_| Vec::with_capacity(n_tokens))
+        .collect();
+    for (_token_pos, layer_idx, entry) in entries {
+        result[layer_idx].push(entry);
     }
 
     result
@@ -2364,5 +2380,247 @@ mod tests {
             got, expected,
             "packed hash_token scale ordering mismatch vs hash_retained_state_direct"
         );
+    }
+
+    /// Serial reference implementation of `compute_kv_transcript`. Kept only for
+    /// the equivalence test below; production code uses the rayon-parallel
+    /// version in the public function.
+    fn compute_kv_transcript_serial(
+        captured_x_attn: &[Vec<Vec<i8>>],
+        weights: &(dyn ShellWeights + Sync),
+        cfg: &verilm_core::constants::ModelConfig,
+        captured_scales: &[Vec<CapturedLayerScales>],
+        per_tensor_scales: &[Vec<f32>],
+        per_channel_scales: &[Vec<Vec<f32>>],
+        qkv_biases: &[[Vec<f32>; 3]],
+    ) -> Vec<Vec<KvEntry>> {
+        let n_layers = cfg.n_layers;
+        let n_tokens = captured_x_attn.len();
+        let use_rope = !per_tensor_scales.is_empty() || !per_channel_scales.is_empty();
+
+        let k_mt_idx = MatrixType::PER_LAYER
+            .iter()
+            .position(|&m| m == MatrixType::Wk)
+            .unwrap();
+        let v_mt_idx = MatrixType::PER_LAYER
+            .iter()
+            .position(|&m| m == MatrixType::Wv)
+            .unwrap();
+
+        let mut result: Vec<Vec<KvEntry>> = (0..n_layers)
+            .map(|_| Vec::with_capacity(n_tokens))
+            .collect();
+
+        for (token_pos, token_x_attn) in captured_x_attn.iter().enumerate() {
+            for layer_idx in 0..n_layers.min(token_x_attn.len()) {
+                let x_attn = &token_x_attn[layer_idx];
+                let scale_x = captured_scales[token_pos][layer_idx].scale_x_attn;
+
+                let k_acc = matmul_i32(
+                    weights.weight(layer_idx, MatrixType::Wk),
+                    x_attn,
+                    cfg.kv_dim,
+                    cfg.hidden_dim,
+                );
+                let v_acc = matmul_i32(
+                    weights.weight(layer_idx, MatrixType::Wv),
+                    x_attn,
+                    cfg.kv_dim,
+                    cfg.hidden_dim,
+                );
+
+                let (k_roped, v_deq) = if use_rope {
+                    let k_f64 = if !per_channel_scales.is_empty()
+                        && layer_idx < per_channel_scales.len()
+                        && !per_channel_scales[layer_idx][k_mt_idx].is_empty()
+                    {
+                        verilm_core::rope::dequantize_acc_per_channel(
+                            &k_acc,
+                            &per_channel_scales[layer_idx][k_mt_idx],
+                            scale_x,
+                        )
+                    } else {
+                        let sw = per_tensor_scales
+                            .get(layer_idx)
+                            .and_then(|s| s.get(k_mt_idx))
+                            .copied()
+                            .unwrap_or(0.0);
+                        verilm_core::rope::dequantize_acc(&k_acc, Some(sw), Some(scale_x))
+                    };
+
+                    let v_f64 = if !per_channel_scales.is_empty()
+                        && layer_idx < per_channel_scales.len()
+                        && !per_channel_scales[layer_idx][v_mt_idx].is_empty()
+                    {
+                        verilm_core::rope::dequantize_acc_per_channel(
+                            &v_acc,
+                            &per_channel_scales[layer_idx][v_mt_idx],
+                            scale_x,
+                        )
+                    } else {
+                        let sw = per_tensor_scales
+                            .get(layer_idx)
+                            .and_then(|s| s.get(v_mt_idx))
+                            .copied()
+                            .unwrap_or(0.0);
+                        verilm_core::rope::dequantize_acc(&v_acc, Some(sw), Some(scale_x))
+                    };
+
+                    let k_f64 =
+                        if layer_idx < qkv_biases.len() && !qkv_biases[layer_idx][1].is_empty() {
+                            k_f64
+                                .iter()
+                                .zip(&qkv_biases[layer_idx][1])
+                                .map(|(&x, &b)| x + b as f64)
+                                .collect()
+                        } else {
+                            k_f64
+                        };
+                    let v_f64 =
+                        if layer_idx < qkv_biases.len() && !qkv_biases[layer_idx][2].is_empty() {
+                            v_f64
+                                .iter()
+                                .zip(&qkv_biases[layer_idx][2])
+                                .map(|(&x, &b)| x + b as f64)
+                                .collect()
+                        } else {
+                            v_f64
+                        };
+
+                    let k_roped = verilm_core::rope::apply_rope_k(&k_f64, token_pos, cfg);
+                    (k_roped, v_f64)
+                } else {
+                    let k_i8 = verilm_core::requantize(&k_acc);
+                    let v_i8 = verilm_core::requantize(&v_acc);
+                    (
+                        k_i8.iter().map(|&b| b as f64).collect(),
+                        v_i8.iter().map(|&b| b as f64).collect(),
+                    )
+                };
+
+                result[layer_idx].push(KvEntry { k_roped, v_deq });
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn kv_transcript_parallel_matches_serial() {
+        use verilm_core::constants::ModelConfig;
+
+        // Toy model: small enough to run quickly, large enough to exercise
+        // multiple tokens × multiple layers across the rayon work-list.
+        let n_layers = 4;
+        let n_tokens = 5;
+        let hidden_dim = 16;
+        let kv_dim = 8;
+
+        struct ToyWeights {
+            wk: Vec<Vec<i8>>, // [layer][hidden * kv_dim]
+            wv: Vec<Vec<i8>>,
+        }
+        impl ShellWeights for ToyWeights {
+            fn weight(&self, layer: usize, mt: MatrixType) -> &[i8] {
+                match mt {
+                    MatrixType::Wk => &self.wk[layer],
+                    MatrixType::Wv => &self.wv[layer],
+                    _ => &[],
+                }
+            }
+        }
+
+        let weights = ToyWeights {
+            wk: (0..n_layers)
+                .map(|l| (0..hidden_dim * kv_dim).map(|i| ((l + i) % 7) as i8 - 3).collect())
+                .collect(),
+            wv: (0..n_layers)
+                .map(|l| (0..hidden_dim * kv_dim).map(|i| ((l + i) % 5) as i8 - 2).collect())
+                .collect(),
+        };
+
+        let captured_x_attn: Vec<Vec<Vec<i8>>> = (0..n_tokens)
+            .map(|t| {
+                (0..n_layers)
+                    .map(|l| (0..hidden_dim).map(|i| ((t + l + i) % 11) as i8 - 5).collect())
+                    .collect()
+            })
+            .collect();
+
+        let captured_scales: Vec<Vec<CapturedLayerScales>> = (0..n_tokens)
+            .map(|t| {
+                (0..n_layers)
+                    .map(|l| CapturedLayerScales {
+                        scale_x_attn: 0.01 + 0.001 * (t * n_layers + l) as f32,
+                        scale_x_ffn: 0.0,
+                        scale_h: 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let cfg = ModelConfig {
+            n_layers,
+            hidden_dim,
+            kv_dim,
+            ..ModelConfig::toy()
+        };
+
+        // Toy path (use_rope = false).
+        let serial = compute_kv_transcript_serial(
+            &captured_x_attn,
+            &weights,
+            &cfg,
+            &captured_scales,
+            &[],
+            &[],
+            &[],
+        );
+        let parallel = compute_kv_transcript(
+            &captured_x_attn,
+            &weights,
+            &cfg,
+            &captured_scales,
+            &[],
+            &[],
+            &[],
+        );
+
+        assert_eq!(parallel.len(), serial.len(), "n_layers mismatch");
+        for layer_idx in 0..serial.len() {
+            assert_eq!(
+                parallel[layer_idx].len(),
+                serial[layer_idx].len(),
+                "layer {} n_tokens mismatch",
+                layer_idx
+            );
+            for token_pos in 0..serial[layer_idx].len() {
+                assert_eq!(
+                    parallel[layer_idx][token_pos].k_roped.len(),
+                    serial[layer_idx][token_pos].k_roped.len()
+                );
+                let s = &serial[layer_idx][token_pos];
+                let p = &parallel[layer_idx][token_pos];
+                // Byte-identical f64 (use total bit comparison via to_bits).
+                for (sv, pv) in s.k_roped.iter().zip(&p.k_roped) {
+                    assert_eq!(
+                        sv.to_bits(),
+                        pv.to_bits(),
+                        "k_roped bit mismatch at layer {} token {}",
+                        layer_idx,
+                        token_pos
+                    );
+                }
+                for (sv, pv) in s.v_deq.iter().zip(&p.v_deq) {
+                    assert_eq!(
+                        sv.to_bits(),
+                        pv.to_bits(),
+                        "v_deq bit mismatch at layer {} token {}",
+                        layer_idx,
+                        token_pos
+                    );
+                }
+            }
+        }
     }
 }

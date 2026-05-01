@@ -831,6 +831,13 @@ fn commit_minimal_from_captures(
     lp_hidden_bf16: Option<&Bound<'_, PyList>>,
     captured_logits_f32: Option<&Bound<'_, PyList>>,
 ) -> PyResult<MinimalBatchStateHandle> {
+    let timers = std::env::var("VERILM_COMMIT_TIMERS").map_or(false, |v| v == "1");
+    let t_entry = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let scales = extract_f32_vec(scales)?;
     let n_entries = o_proj_inputs.len();
 
@@ -883,8 +890,20 @@ fn commit_minimal_from_captures(
         }
     }
 
+    let t_captures = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let (all_retained, captured_scales, captured_x_attn) =
         verilm_prover::build_retained_from_captures(&captures, n_layers, &fwd_batch_sizes);
+
+    let t_retained = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     if sampling_seed.len() != 32 {
         return Err(PyValueError::new_err(
@@ -903,6 +922,12 @@ fn commit_minimal_from_captures(
             vecs.push(extract_f32_vec(&fr_list.get_item(i)?)?);
         }
         Some(vecs)
+    } else {
+        None
+    };
+
+    let t_finalres = if timers {
+        Some(std::time::Instant::now())
     } else {
         None
     };
@@ -927,6 +952,12 @@ fn commit_minimal_from_captures(
         None
     };
 
+    let t_lphidden = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     // Extract per-token captured f32 logits if provided.
     let captured_logits = if let Some(cl_list) = captured_logits_f32 {
         let mut vecs = Vec::with_capacity(cl_list.len());
@@ -934,6 +965,12 @@ fn commit_minimal_from_captures(
             vecs.push(extract_f32_vec(&cl_list.get_item(i)?)?);
         }
         Some(vecs)
+    } else {
+        None
+    };
+
+    let t_logits = if timers {
+        Some(std::time::Instant::now())
     } else {
         None
     };
@@ -957,6 +994,12 @@ fn commit_minimal_from_captures(
         None
     };
 
+    let t_kv = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let (commitment, inner) = verilm_prover::commit_minimal(
         all_retained,
         &FullBindingParams {
@@ -973,6 +1016,26 @@ fn commit_minimal_from_captures(
         lp_hidden,
         captured_logits,
     );
+
+    if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5), Some(t6)) =
+        (t_entry, t_captures, t_retained, t_finalres, t_lphidden, t_logits, t_kv)
+    {
+        let ms = |a: std::time::Instant, b: std::time::Instant| {
+            b.duration_since(a).as_secs_f64() * 1000.0
+        };
+        eprintln!(
+            "verilm-py commit_minimal_from_captures: extract_entries={:.1}ms build_retained={:.1}ms \
+             extract_finalres={:.1}ms extract_lphidden={:.1}ms extract_logits={:.1}ms \
+             kv_transcript={:.1}ms rust_inner={:.1}ms",
+            ms(t0, t1),
+            ms(t1, t2),
+            ms(t2, t3),
+            ms(t3, t4),
+            ms(t4, t5),
+            ms(t5, t6),
+            t6.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
 
     Ok(MinimalBatchStateHandle {
         inner,
@@ -1218,6 +1281,13 @@ fn commit_minimal_packed(
     final_res_dim: usize,
     n_prompt_tokens: Option<u32>,
 ) -> PyResult<PackedBatchStateHandle> {
+    let timers = std::env::var("VERILM_COMMIT_TIMERS").map_or(false, |v| v == "1");
+    let t_entry = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     // Extract packed_a via buffer protocol (one copy into Rust Vec<u8>).
     let a_bytes: Vec<u8> = if let Ok(b) = packed_a.cast::<PyBytes>() {
         b.as_bytes().to_vec()
@@ -1283,6 +1353,12 @@ fn commit_minimal_packed(
 
     let manifest_obj = manifest.map(extract_manifest).transpose()?;
 
+    let t_extract_done = if timers {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let (commitment, inner) = verilm_prover::commit_minimal_packed(
         a_bytes,
         packed_scales,
@@ -1299,6 +1375,15 @@ fn commit_minimal_packed(
         fr_bytes,
         final_res_dim,
     );
+
+    if let (Some(t0), Some(t1)) = (t_entry, t_extract_done) {
+        let extract_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
+        let rust_inner_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "verilm-py commit_minimal_packed: extract={:.1}ms rust_inner={:.1}ms",
+            extract_ms, rust_inner_ms
+        );
+    }
 
     Ok(PackedBatchStateHandle {
         inner,

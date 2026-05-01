@@ -323,7 +323,7 @@ impl VerificationProfile {
 ///
 /// Used by the prover to compute shell openings at audit time,
 /// and optionally by the verifier for debug/oracle replay.
-pub trait ShellWeights {
+pub trait ShellWeights: Sync {
     fn weight(&self, layer: usize, mt: MatrixType) -> &[i8];
 }
 

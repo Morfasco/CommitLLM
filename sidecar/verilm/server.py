@@ -1116,8 +1116,16 @@ class VerifiedInferenceServer:
         import verilm_rs
         import numpy as np
 
+        timers = self._chat_timers
+        if timers:
+            import time as _t
+            t0 = _t.monotonic()
+
         o_proj_inputs = [inp.numpy() for inp in o_inputs]
         x_attn_np = [inp.numpy() for inp in x_attn_inputs] if x_attn_inputs else None
+
+        if timers:
+            t_numpy = _t.monotonic()
 
         # Organize per-token final residuals from per-forward-pass captures.
         # model.norm hook fires once per forward pass with shape (batch_sz, hidden_dim).
@@ -1137,6 +1145,9 @@ class VerifiedInferenceServer:
                         final_residuals.append(fwd_tensor[pos].numpy())
                     else:
                         final_residuals.append(fwd_tensor.numpy())
+
+        if timers:
+            t_fr = _t.monotonic()
 
         # Organize LP hidden: LogitsProcessor hook captures (batch, hidden_dim) bf16
         # per forward pass. Expand by fwd_batch_sizes to get one entry per token,
@@ -1159,7 +1170,10 @@ class VerifiedInferenceServer:
                         arr = row.view(torch.int16).numpy().view(np.uint16).ravel()
                         lp_hidden_list.append(arr)
 
-        return verilm_rs.commit_minimal_from_captures(
+        if timers:
+            t_lph = _t.monotonic()
+
+        result = verilm_rs.commit_minimal_from_captures(
             o_proj_inputs=o_proj_inputs,
             scales=scales,
             n_layers=n_layers,
@@ -1175,6 +1189,27 @@ class VerifiedInferenceServer:
             lp_hidden_bf16=lp_hidden_list,
             captured_logits_f32=captured_logits_raw if captured_logits_raw else None,
         )
+
+        if timers:
+            t_rust = _t.monotonic()
+            n_tok = sum(fwd_batch_sizes)
+            assemble_ms = (t_lph - t0) * 1000
+            rs_total_ms = (t_rust - t_lph) * 1000
+            total_ms = (t_rust - t0) * 1000
+            logger.info(
+                "verilm commit timers (non-packed): numpy=%.1fms fr=%.1fms lph=%.1fms "
+                "assemble=%.1fms rs_total=%.1fms total=%.1fms (%d tokens, %.2fms/tok)",
+                (t_numpy - t0) * 1000,
+                (t_fr - t_numpy) * 1000,
+                (t_lph - t_fr) * 1000,
+                assemble_ms,
+                rs_total_ms,
+                total_ms,
+                n_tok,
+                total_ms / max(n_tok, 1),
+            )
+
+        return result
 
     def _commit_minimal_packed(self, o_inputs, scales, n_fwd, n_layers,
                                fwd_batch_sizes, all_token_ids, prompt, seed, manifest,
@@ -1253,17 +1288,22 @@ class VerifiedInferenceServer:
         if timers:
             t_rust = _t.monotonic()
             n_tok = sum(fwd_batch_sizes)
+            assemble_ms = (t_pack_fr - t0) * 1000
+            rs_total_ms = (t_rust - t_pack_fr) * 1000
+            total_ms = (t_rust - t0) * 1000
             logger.info(
                 "verilm commit timers: numpy=%.1fms scales=%.1fms concat=%.1fms "
-                "pack_fr=%.1fms rust=%.1fms total=%.1fms (%d tokens, %.2fms/tok)",
+                "pack_fr=%.1fms assemble=%.1fms rs_total=%.1fms total=%.1fms "
+                "(%d tokens, %.2fms/tok)",
                 (t_numpy - t0) * 1000,
                 (t_scales - t_numpy) * 1000,
                 (t_concat - t_scales) * 1000,
                 (t_pack_fr - t_concat) * 1000,
-                (t_rust - t_pack_fr) * 1000,
-                (t_rust - t0) * 1000,
+                assemble_ms,
+                rs_total_ms,
+                total_ms,
                 n_tok,
-                (t_rust - t0) * 1000 / max(n_tok, 1),
+                total_ms / max(n_tok, 1),
             )
 
         return result

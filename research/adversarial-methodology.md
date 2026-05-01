@@ -72,6 +72,103 @@ The attention corridor allows L∞ ≤ τ (empirically τ=8 for Qwen, τ=9 for L
 - Amplification: if each layer contributes ±τ error, does the error compound across L layers? What's the worst-case output divergence after 28 layers of ±8 perturbation?
 - Can the adversary use the tolerance to perform a "model morphing" attack — gradually shift computation toward a cheaper model while staying within bounds?
 
+### 2d. Stock-mode attention forgery under the current audit-only contract
+
+The current product path does **not** verify arbitrary-position attention outputs.
+It does bind and/or audit:
+
+- pre-attention boundary / `x_attn` where captured
+- KV transcript / opened `K/V`
+- witnessed pre-softmax scores (currently for the last generated token)
+- GQA / RoPE / causal-mask wiring
+- post-attention boundary `a`
+- downstream shell / decode / logits
+
+This means the live attacker problem is no longer "forge arbitrary attention with
+no constraints." It is:
+
+> Can the adversary precommit a fake post-attention output `a` that survives
+> score anchoring, KV provenance, wiring audits, and exact downstream decode?
+
+That is the stock-mode attention red-team target.
+
+#### Concrete attack families
+
+| Attack | Constraint | Why it matters |
+|--------|------------|----------------|
+| Single-layer fake-`a` | Keep `Q/K/V`, scores, and wiring honest; replace one layer's `a`; run downstream honestly | Measures the exact remaining hole |
+| Sparse layer cheating | Fake `a` on 1, 2, 4, or N layers only | Tests detectability under realistic audit sampling |
+| Early-vs-late layer cheating | Cheat only on early or late layers | Quantifies which layers are economically dangerous |
+| Last-token-only evasion | Behave honestly on the last generated token (where score anchoring is live), cheat elsewhere | Measures how much the current witness scope limits detectability |
+| Local-window evasion | Behave honestly on token-0 / local replay smoke windows, cheat outside them | Measures whether smoke checks catch meaningful attacks |
+| Downstream-consistent forgery | Pick fake `a`, then recompute the rest of the model honestly | Strongest realistic attacker under current product assumptions |
+| Missing-evidence attack | Suppress scores / wiring metadata / KV evidence and hope the verifier soft-skips | Must become fail-closed once rollout is complete |
+
+#### Metrics to report
+
+Do not report only pass/fail. Report:
+
+- token-flip rate under fake-`a` attacks
+- detection rate under the current live audit policy
+- smallest `||delta a||` that flips the accepted token
+- earliest / latest cheating layer that changes the answer
+- which audit catches the attack first:
+  - score anchoring
+  - KV provenance
+  - wiring
+  - local replay smoke
+  - downstream decode / logits
+- attack success conditioned on:
+  - number of audited generated tokens
+  - number of audited layers per token
+  - whether score witness is present
+  - whether local replay smoke is enabled
+
+#### Immediate test campaign
+
+Phase this as an actual test plan, not an open-ended research note:
+
+1. **Offline fake-`a` harness**
+   - take an honest committed trace
+   - patch one `(token, layer)` post-attention `a`
+   - run the rest of the model honestly from the patched boundary
+   - verify whether the receipt still passes and whether the final token changes
+
+2. **Sparse cheating sweep**
+   - cheat on `1, 2, 4, 8` layers
+   - separate early-only and late-only attacks
+   - record detection probability under current sampled audits
+
+3. **Witness-scope evasion**
+   - force honest behavior on the last generated token
+   - cheat on earlier generated tokens
+   - quantify how much the current last-token score witness limits detection
+
+4. **Local replay evasion**
+   - cheat inside the token-0 / local smoke window
+   - cheat outside it
+   - measure incremental value of B4 if enabled
+
+5. **Canary prompts**
+   - long-range retrieval
+   - masking-sensitive prompts
+   - position-sensitive prompts
+   - cache-indexing-sensitive prompts
+
+#### Product interpretation rule
+
+If these tests show that small sparse fake-`a` attacks frequently flip outputs
+without being caught, the product claim must stay narrow and the roadmap should
+prioritize stronger anti-cheat bindings (for example score-root commitment or
+broader audit sampling) before broadening any trust language.
+
+If they show that useful attacks require large precommitted perturbations and are
+caught reliably under practical audit rates, then the right claim is still not
+"verified attention" but rather:
+
+> attention cheating is materially constrained and operationally detectable under
+> the shipped audit policy.
+
 ---
 
 ## 3. Composition attacks
@@ -174,6 +271,9 @@ Given white-box access to the verifier, use optimization (gradient descent or se
 - [ ] Tolerance zone exploitation (maximum output divergence within corridor bounds)
 - [ ] Composition attacks (multi-field, multi-layer coordinated perturbations)
 - [ ] Probabilistic security curve (10K strategies × 6 audit rates)
+- [ ] Stock-mode attention fake-`a` campaign (single-layer, sparse-layer, early/late)
+- [ ] Last-token-witness evasion campaign
+- [ ] Local replay smoke incremental-value measurement
 
 ### Phase 3: Protocol-level (blocks production deployment)
 
@@ -181,6 +281,7 @@ Given white-box access to the verifier, use optimization (gradient descent or se
 - [ ] Hot-swap detection testing
 - [ ] Commitment ordering race conditions
 - [ ] Gradient-based forgery feasibility study
+- [ ] Fail-closed rollout for missing audited attention evidence
 
 ---
 
